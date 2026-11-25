@@ -205,10 +205,19 @@ and commit-before-ack reaction collection:
 
 - `send -id <int64> -taken <ts>`: explicit `Media.Id` / `ContentId` and capture
   timestamp (Unix milliseconds or RFC3339). Single-file only when `-id` is non-zero.
-- `send-batch`: reads JSONL items on stdin
-  (`{"ref","path","id","taken","caption","fit","extension"}`) over one frame
-  connection and flushes per-item JSON results (`{"ref","path","id","ok","error"}`)
-  to stdout.
+- `send-batch`: reads JSONL upload descriptors on stdin
+  (`{"ref","path","media_id","taken","caption","fit","extension"}`, also accepts
+  `"id"`) over one connection and flushes per-item JSON results
+  (`{"ref","path","id","media_id","ok","error"}`) to stdout. Hard limit:
+  maximum 100 items per batch (enforced before connecting).
+- `delete-batch`: reads newline-delimited `media_id`s or JSONL objects
+  (`{"media_id","ref"}`, also accepts `"id"`) from stdin and deletes them over
+  one connection, emitting per-item JSON results. Hard limit: maximum 100 items
+  per batch (enforced before connecting).
+- `hide-batch`: reads newline-delimited `media_id`s or JSONL objects
+  (`{"media_id","ref"}`, also accepts `"id"`) from stdin and hides them over
+  one connection, emitting per-item JSON results. Hard limit: maximum 100 items
+  per batch (enforced before connecting).
 - `-json`: machine-readable JSON output for `info`, `list`, `send`, `reactions`,
   and `ack-reactions`.
 - `reactions [-ack] [-wait <dur>]`: triggers a reaction flush (`GetInfo`),

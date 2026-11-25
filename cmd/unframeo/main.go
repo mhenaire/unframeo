@@ -33,15 +33,17 @@ Commands:
   pair <code>        pair with the frame showing this code
   info               describe the frame
   send <file|url>... send photos, from disk or from the web
-  send-batch         send photos described by JSON lines on standard input
+  send-batch         send up to 100 photos (max 100) from JSONL on stdin
   list               list the photos on the frame
   reactions          collect queued photo reactions from the frame
   ack-reactions <id>...
                      acknowledge reaction IDs so the frame drops them
   get <id>... | all  copy photos off the frame into files
   hide <id>...       hide photos without removing them
+  hide-batch         hide up to 100 photos (max 100) from media IDs or JSONL on stdin
   show <id>...       show photos that were hidden
   delete <id>...     remove photos from the frame
+  delete-batch       delete up to 100 photos (max 100) from media IDs or JSONL on stdin
   permission view|manage
                      ask the frame's owner to let this client view, or
                      manage, its photos
@@ -82,6 +84,10 @@ send takes an http or https URL wherever it takes a path. Every photo is
 fetched before the frame is connected to, so a link that does not answer
 costs nothing, and the format is read off the photo itself, falling back to
 what the server called it and then to the URL's own extension.
+
+send-batch, delete-batch, and hide-batch each run over a single connection and
+enforce a hard limit of 100 items per batch; any batch exceeding 100 items is
+rejected before opening a connection.
 
 get writes each photo as <date>_<time>_<id>.<extension> in the current
 directory unless -out says otherwise, so a directory of them sorts into the
@@ -173,7 +179,7 @@ func runWithIO(args []string, stdin io.Reader, stdout io.Writer) error {
 	o := options{in: stdin, out: stdout}
 	fs := flag.NewFlagSet("unframeo", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	fs.Usage = func() {}
 	fs.StringVar(&o.frame, "frame", "", "which paired frame to use")
 	fs.StringVar(&o.caption, "caption", "", "caption to send with a photo")
 	fs.Int64Var(&o.photoID, "id", 0, "photo id for send")
@@ -192,6 +198,11 @@ func runWithIO(args []string, stdin io.Reader, stdout io.Writer) error {
 	fs.StringVar(&o.server, "server", "", "grid server to use")
 	fs.BoolVar(&o.verbose, "v", false, "log the protocol exchange")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, usage)
+			return nil
+		}
+		fmt.Fprint(os.Stderr, usage)
 		return errors.New("run \"unframeo\" with no arguments for usage")
 	}
 
@@ -232,6 +243,14 @@ func runWithIO(args []string, stdin io.Reader, stdout io.Writer) error {
 		fmt.Fprint(os.Stderr, usage)
 		return fmt.Errorf("unknown command %q", cmdName)
 	}
+	if wantsHelp(args[1:]) {
+		if msg, ok := subcommandHelp[cmdName]; ok {
+			fmt.Fprint(stdout, msg)
+		} else {
+			fmt.Fprint(stdout, usage)
+		}
+		return nil
+	}
 
 	cfg, err := loadConfig(cmdName, o.configPath)
 	if err != nil {
@@ -268,7 +287,11 @@ func dispatch(ctx context.Context, cfg *config.Config, o *options, cmd string, r
 	case "send":
 		return cmdSend(ctx, cfg, o, rest)
 	case "send-batch":
-		return cmdSendBatch(ctx, cfg, o)
+		return cmdSendBatch(ctx, cfg, o, rest)
+	case "delete-batch":
+		return cmdDeleteBatch(ctx, cfg, o, rest)
+	case "hide-batch":
+		return cmdHideBatch(ctx, cfg, o, rest)
 	case "list":
 		return cmdList(ctx, cfg, o)
 	case "reactions":
@@ -342,10 +365,11 @@ func loadConfig(cmdName, path string) (*config.Config, error) {
 // knownCommands is checked before anything is read or written, so an unknown
 // command has no side effects.
 var knownCommands = map[string]bool{
-	"pair": true, "info": true, "send": true, "send-batch": true, "list": true, "delete": true,
+	"pair": true, "info": true, "send": true, "send-batch": true,
+	"list": true, "delete": true, "delete-batch": true,
 	"reactions": true, "ack-reactions": true,
 	"get":  true,
-	"hide": true, "show": true,
+	"hide": true, "hide-batch": true, "show": true,
 	"permission": true,
 	"discover":   true,
 	"frames":     true, "forget": true, "name": true, "whoami": true, "raw": true,

@@ -19,7 +19,62 @@ import (
 	"github.com/borje/unframeo/internal/frameo/pb"
 )
 
-const defaultCLISettle = time.Second
+const (
+	defaultCLISettle = time.Second
+	// maxBatchItems bounds single-connection batch operations to keep frame
+	// transfers and protocol requests bounded.
+	maxBatchItems = 100
+)
+
+var subcommandHelp = map[string]string{
+	"send-batch": `Usage: unframeo [options] send-batch
+
+Reads newline-delimited JSON (JSONL) upload descriptors from standard input
+and sends them over a single connection to the frame, writing one JSON result
+line per item to standard output.
+
+Descriptor fields:
+  path        file path to upload (required)
+  media_id    optional explicit 64-bit photo id (alias: id)
+  taken       optional capture time (Unix milliseconds or RFC3339 string)
+  caption     optional caption overriding -caption
+  fit         optional bool overriding -fit
+  extension   optional format override
+  ref         optional opaque caller reference echoed in results
+
+Limit: maximum 100 items per batch; batches containing more than 100 items are
+rejected before opening a connection.
+`,
+	"delete-batch": `Usage: unframeo [options] delete-batch
+
+Reads newline-delimited media IDs (integers) or JSONL objects
+({"media_id": <int64>, "ref": "..."}; alias: "id") from standard input and
+deletes them over a single connection to the frame, writing one JSON result
+line per item to standard output.
+
+Limit: maximum 100 items per batch; batches containing more than 100 items are
+rejected before opening a connection.
+`,
+	"hide-batch": `Usage: unframeo [options] hide-batch
+
+Reads newline-delimited media IDs (integers) or JSONL objects
+({"media_id": <int64>, "ref": "..."}; alias: "id") from standard input and
+hides them over a single connection to the frame, writing one JSON result line
+per item to standard output.
+
+Limit: maximum 100 items per batch; batches containing more than 100 items are
+rejected before opening a connection.
+`,
+}
+
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+	return false
+}
 
 func parseTaken(s string) (time.Time, error) {
 	s = strings.TrimSpace(s)
@@ -138,28 +193,116 @@ func writeJSONList(w io.Writer, items []*pb.MediaMetaData) error {
 type batchItem struct {
 	Ref       string          `json:"ref,omitempty"`
 	Path      string          `json:"path"`
-	ID        int64           `json:"id,omitempty"`
+	ID        *int64          `json:"id,omitempty"`
+	MediaID   *int64          `json:"media_id,omitempty"`
 	Taken     json.RawMessage `json:"taken,omitempty"`
 	Caption   string          `json:"caption,omitempty"`
 	Fit       *bool           `json:"fit,omitempty"`
 	Extension string          `json:"extension,omitempty"`
 }
 
-type batchResult struct {
-	Ref   string `json:"ref,omitempty"`
-	Path  string `json:"path"`
-	ID    int64  `json:"id,omitempty"`
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+type batchIDItem struct {
+	Ref      string `json:"ref,omitempty"`
+	ID       *int64 `json:"id,omitempty"`
+	MediaID  *int64 `json:"media_id,omitempty"`
+	resolved int64
 }
 
-func cmdSendBatch(ctx context.Context, cfg *config.Config, o *options) error {
-	reader := bufio.NewReader(o.in)
+type batchResult struct {
+	Ref     string `json:"ref,omitempty"`
+	Path    string `json:"path,omitempty"`
+	ID      int64  `json:"id,omitempty"`
+	MediaID int64  `json:"media_id,omitempty"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
+}
+
+func resolveBatchID(id, mediaID *int64) (int64, error) {
+	if id != nil && mediaID != nil && *id != *mediaID {
+		return 0, fmt.Errorf("conflicting id (%d) and media_id (%d)", *id, *mediaID)
+	}
+	if mediaID != nil {
+		return *mediaID, nil
+	}
+	if id != nil {
+		return *id, nil
+	}
+	return 0, nil
+}
+
+// readBatchLines collects non-empty trimmed lines from r up to maxBatchItems.
+// Returning an error as soon as item maxBatchItems+1 appears ensures oversized
+// batches fail cleanly before connecting to a frame.
+func readBatchLines(r io.Reader, cmdName string) ([][]byte, error) {
+	reader := bufio.NewReader(r)
+	var lines [][]byte
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("reading %s input: %w", cmdName, err)
+		}
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			if len(lines) >= maxBatchItems {
+				return nil, fmt.Errorf("%s: batch exceeds maximum of %d items (rejected before connecting)", cmdName, maxBatchItems)
+			}
+			lines = append(lines, trimmed)
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+	}
+	return lines, nil
+}
+
+type parsedSendItem struct {
+	raw   batchItem
+	id    int64
+	taken time.Time
+}
+
+func parseSendBatch(r io.Reader) ([]parsedSendItem, error) {
+	lines, err := readBatchLines(r, "send-batch")
+	if err != nil {
+		return nil, err
+	}
+	items := make([]parsedSendItem, 0, len(lines))
+	for i, line := range lines {
+		var item batchItem
+		if err := json.Unmarshal(line, &item); err != nil {
+			return nil, fmt.Errorf("send-batch line %d: %w", i+1, err)
+		}
+		id, err := resolveBatchID(item.ID, item.MediaID)
+		if err != nil {
+			return nil, fmt.Errorf("send-batch line %d: %w", i+1, err)
+		}
+		var taken time.Time
+		if len(bytes.TrimSpace(item.Taken)) > 0 {
+			taken, err = parseTakenJSON(item.Taken)
+			if err != nil {
+				return nil, fmt.Errorf("send-batch line %d: %w", i+1, err)
+			}
+		}
+		items = append(items, parsedSendItem{raw: item, id: id, taken: taken})
+	}
+	return items, nil
+}
+
+func cmdSendBatch(ctx context.Context, cfg *config.Config, o *options, args []string) error {
+	if len(args) > 0 {
+		return errors.New("usage: unframeo send-batch")
+	}
+	items, err := parseSendBatch(o.in)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return nil
+	}
+
 	var (
 		c      *frameo.Client
-		total  int
 		failed int
-		lineNo int
 	)
 	defer func() {
 		if c != nil {
@@ -167,40 +310,25 @@ func cmdSendBatch(ctx context.Context, cfg *config.Config, o *options) error {
 		}
 	}()
 
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("reading send-batch input: %w", err)
+	for _, entry := range items {
+		sendErr, fatal := processBatchItem(ctx, cfg, o, &c, entry)
+		if fatal != nil {
+			return fatal
 		}
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) > 0 {
-			lineNo++
-			total++
-			var item batchItem
-			if uerr := json.Unmarshal(trimmed, &item); uerr != nil {
-				return fmt.Errorf("send-batch line %d: %w", lineNo, uerr)
-			}
-			sendErr, fatal := processBatchItem(ctx, cfg, o, &c, item)
-			if fatal != nil {
-				return fatal
-			}
-			if sendErr != nil {
-				failed++
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			break
+		if sendErr != nil {
+			failed++
 		}
 	}
 
 	if failed > 0 {
-		return fmt.Errorf("%d of %d batch items failed", failed, total)
+		return fmt.Errorf("%d of %d batch items failed", failed, len(items))
 	}
 	return nil
 }
 
-func processBatchItem(ctx context.Context, cfg *config.Config, o *options, cp **frameo.Client, item batchItem) (itemErr, fatalErr error) {
-	res := batchResult{Ref: item.Ref, Path: item.Path, ID: item.ID}
+func processBatchItem(ctx context.Context, cfg *config.Config, o *options, cp **frameo.Client, entry parsedSendItem) (itemErr, fatalErr error) {
+	item := entry.raw
+	res := batchResult{Ref: item.Ref, Path: item.Path, ID: entry.id, MediaID: entry.id}
 	emitErr := func(err error) error {
 		res.OK = false
 		res.Error = err.Error()
@@ -220,16 +348,10 @@ func processBatchItem(ctx context.Context, cfg *config.Config, o *options, cp **
 		}
 		return err, nil
 	}
+
 	taken := o.taken
-	if len(bytes.TrimSpace(item.Taken)) > 0 {
-		parsed, err := parseTakenJSON(item.Taken)
-		if err != nil {
-			if werr := emitErr(err); werr != nil {
-				return nil, werr
-			}
-			return err, nil
-		}
-		taken = parsed
+	if !entry.taken.IsZero() {
+		taken = entry.taken
 	}
 
 	if *cp == nil {
@@ -251,7 +373,7 @@ func processBatchItem(ctx context.Context, cfg *config.Config, o *options, cp **
 	}
 
 	id, err := (*cp).SendPhoto(ctx, frameo.Photo{
-		ID:            item.ID,
+		ID:            entry.id,
 		Path:          item.Path,
 		Extension:     item.Extension,
 		Taken:         taken,
@@ -273,11 +395,97 @@ func processBatchItem(ctx context.Context, cfg *config.Config, o *options, cp **
 	}
 
 	res.ID = id
+	res.MediaID = id
 	res.OK = true
 	if werr := writeJSON(o.out, res); werr != nil {
 		return nil, werr
 	}
 	return nil, nil
+}
+
+func parseBatchIDs(r io.Reader, cmdName string) ([]batchIDItem, error) {
+	lines, err := readBatchLines(r, cmdName)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]batchIDItem, 0, len(lines))
+	for i, line := range lines {
+		var item batchIDItem
+		if line[0] == '{' {
+			if err := json.Unmarshal(line, &item); err != nil {
+				return nil, fmt.Errorf("%s line %d: %w", cmdName, i+1, err)
+			}
+			id, err := resolveBatchID(item.ID, item.MediaID)
+			if err != nil {
+				return nil, fmt.Errorf("%s line %d: %w", cmdName, i+1, err)
+			}
+			if id == 0 {
+				return nil, fmt.Errorf("%s line %d: missing media_id", cmdName, i+1)
+			}
+			item.resolved = id
+		} else {
+			id, err := strconv.ParseInt(string(line), 10, 64)
+			if err != nil || id == 0 {
+				return nil, fmt.Errorf("%s line %d: invalid media_id %q", cmdName, i+1, string(line))
+			}
+			item.resolved = id
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func cmdDeleteBatch(ctx context.Context, cfg *config.Config, o *options, args []string) error {
+	return runIDBatch(ctx, cfg, o, "delete-batch", args, func(c *frameo.Client, ids []int64) error {
+		return c.DeleteMedia(ctx, ids)
+	})
+}
+
+func cmdHideBatch(ctx context.Context, cfg *config.Config, o *options, args []string) error {
+	return runIDBatch(ctx, cfg, o, "hide-batch", args, func(c *frameo.Client, ids []int64) error {
+		return c.SetMediaVisible(ctx, ids, false)
+	})
+}
+
+func runIDBatch(ctx context.Context, cfg *config.Config, o *options, cmdName string, args []string, op func(*frameo.Client, []int64) error) error {
+	if len(args) > 0 {
+		return fmt.Errorf("usage: unframeo %s", cmdName)
+	}
+	items, err := parseBatchIDs(o.in, cmdName)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return nil
+	}
+
+	c, _, err := connect(ctx, cfg, o)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	ids := make([]int64, len(items))
+	for i, item := range items {
+		ids[i] = item.resolved
+	}
+	opErr := op(c, ids)
+	errStr := ""
+	if opErr != nil {
+		errStr = opErr.Error()
+	}
+	for _, item := range items {
+		if werr := writeJSON(o.out, batchResult{
+			Ref:     item.Ref,
+			ID:      item.resolved,
+			MediaID: item.resolved,
+			OK:      opErr == nil,
+			Error:   errStr,
+		}); werr != nil {
+			return werr
+		}
+	}
+	return opErr
 }
 
 func cmdReactions(ctx context.Context, cfg *config.Config, o *options) error {

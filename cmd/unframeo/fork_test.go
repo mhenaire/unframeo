@@ -150,12 +150,12 @@ func TestSendBatch(t *testing.T) {
 	}
 
 	b1, _ := json.Marshal(map[string]any{
-		"ref":     "asset-1",
-		"path":    p1,
-		"id":      int64(5001),
-		"taken":   int64(1700000001000),
-		"caption": "First",
-		"fit":     true,
+		"ref":      "asset-1",
+		"path":     p1,
+		"media_id": int64(5001),
+		"taken":    int64(1700000001000),
+		"caption":  "First",
+		"fit":      true,
 	})
 	b2, _ := json.Marshal(map[string]any{
 		"ref":     "asset-2",
@@ -166,9 +166,9 @@ func TestSendBatch(t *testing.T) {
 		"fit":     false,
 	})
 	bMissing, _ := json.Marshal(map[string]any{
-		"ref":  "asset-missing",
-		"path": filepath.Join(dir, "nope.webp"),
-		"id":   int64(5003),
+		"ref":      "asset-missing",
+		"path":     filepath.Join(dir, "nope.webp"),
+		"media_id": int64(5003),
 	})
 
 	stdin := string(b1) + "\n\n" + string(b2) + "\n"
@@ -188,10 +188,10 @@ func TestSendBatch(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[1]), &r2); err != nil {
 		t.Fatal(err)
 	}
-	if !r1.OK || r1.ID != 5001 || r1.Ref != "asset-1" {
+	if !r1.OK || r1.ID != 5001 || r1.MediaID != 5001 || r1.Ref != "asset-1" {
 		t.Fatalf("unexpected r1: %+v", r1)
 	}
-	if !r2.OK || r2.ID != 5002 || r2.Ref != "asset-2" {
+	if !r2.OK || r2.ID != 5002 || r2.MediaID != 5002 || r2.Ref != "asset-2" {
 		t.Fatalf("unexpected r2: %+v", r2)
 	}
 
@@ -284,5 +284,135 @@ func TestReactionsAndAckCLI(t *testing.T) {
 	}
 	if rem := frame.RemainingReactions(); len(rem) != 0 {
 		t.Fatalf("expected 0 remaining reactions after stdin ack, got %d", len(rem))
+	}
+}
+
+func TestDeleteAndHideBatch(t *testing.T) {
+	frame := frameotest.New()
+	frame.DeleteType = frameo.TypeDeleteMedia
+	frame.VisibilityType = frameo.TypeChangeMediaVisibility
+	frame.Library = []*pb.MediaMetaData{
+		{MediaId: 101, IsVisible: true},
+		{MediaId: 102, IsVisible: true},
+		{MediaId: 103, IsVisible: true},
+	}
+	server := pairTestFrame(t, frame)
+
+	// Mixed raw IDs + JSONL objects for hide-batch.
+	hideIn := "101\n{\"media_id\":102,\"ref\":\"h2\"}\n\n"
+	out, err := runCLIWithStdin(t, hideIn, "-server", server, "-net", "relay", "hide-batch")
+	if err != nil {
+		t.Fatalf("hide-batch: %v\n%s", err, out)
+	}
+	if frame.Library[0].GetIsVisible() || frame.Library[1].GetIsVisible() || !frame.Library[2].GetIsVisible() {
+		t.Fatalf("unexpected visibility after hide-batch: %+v", frame.Library)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("hide-batch emitted %d lines, want 2: %s", len(lines), out)
+	}
+	var h2 batchResult
+	if err := json.Unmarshal([]byte(lines[1]), &h2); err != nil {
+		t.Fatal(err)
+	}
+	if !h2.OK || h2.MediaID != 102 || h2.Ref != "h2" {
+		t.Fatalf("unexpected h2 result: %+v", h2)
+	}
+
+	// Mixed raw IDs + JSONL objects for delete-batch.
+	delIn := "101\n{\"id\":103,\"ref\":\"d3\"}\n"
+	out, err = runCLIWithStdin(t, delIn, "-server", server, "-net", "relay", "delete-batch")
+	if err != nil {
+		t.Fatalf("delete-batch: %v\n%s", err, out)
+	}
+	deleted := frame.Deleted()
+	if len(deleted) != 2 || deleted[0] != 101 || deleted[1] != 103 {
+		t.Fatalf("deleted = %v, want [101 103]", deleted)
+	}
+
+	// Exactly 100 items must be accepted in one call.
+	var hundred strings.Builder
+	for i := int64(1); i <= maxBatchItems; i++ {
+		hundred.WriteString(strconv.FormatInt(i, 10))
+		hundred.WriteByte('\n')
+	}
+	out, err = runCLIWithStdin(t, hundred.String(), "-server", server, "-net", "relay", "hide-batch")
+	if err != nil {
+		t.Fatalf("hide-batch 100 items failed: %v", err)
+	}
+	if lines := strings.Split(strings.TrimSpace(out), "\n"); len(lines) != maxBatchItems {
+		t.Fatalf("hide-batch 100 emitted %d lines, want %d", len(lines), maxBatchItems)
+	}
+}
+
+func TestBatchMaxLimitEnforcedBeforeConnecting(t *testing.T) {
+	frame := frameotest.New()
+	frame.DeleteType = frameo.TypeDeleteMedia
+	frame.VisibilityType = frameo.TypeChangeMediaVisibility
+	pairTestFrame(t, frame)
+
+	dir := t.TempDir()
+	img := filepath.Join(dir, "tiny.webp")
+	if err := os.WriteFile(img, []byte("RIFFxxxxWEBP"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lineBytes, _ := json.Marshal(map[string]any{"path": img, "media_id": 1})
+	var sendOver, idOver strings.Builder
+	for i := 1; i <= maxBatchItems+1; i++ {
+		sendOver.Write(lineBytes)
+		sendOver.WriteByte('\n')
+		idOver.WriteString(strconv.FormatInt(int64(i), 10))
+		idOver.WriteByte('\n')
+	}
+
+	// Point at an unreachable server; if any command attempted to connect before
+	// enforcing the 100-item limit, it would fail with a connection error instead.
+	for _, tc := range []struct {
+		cmd   string
+		stdin string
+	}{
+		{"send-batch", sendOver.String()},
+		{"delete-batch", idOver.String()},
+		{"hide-batch", idOver.String()},
+	} {
+		t.Run(tc.cmd, func(t *testing.T) {
+			out, err := runCLIWithStdin(t, tc.stdin, "-server", "127.0.0.1:1", "-net", "relay", tc.cmd)
+			if err == nil {
+				t.Fatalf("%s accepted %d items", tc.cmd, maxBatchItems+1)
+			}
+			if !strings.Contains(err.Error(), "100") {
+				t.Fatalf("%s error = %v, want message mentioning 100-item limit", tc.cmd, err)
+			}
+			if strings.TrimSpace(out) != "" {
+				t.Fatalf("%s wrote unexpected stdout before rejecting: %q", tc.cmd, out)
+			}
+			if len(frame.ClientNames()) != 0 {
+				t.Fatalf("%s opened a connection despite >100 items", tc.cmd)
+			}
+		})
+	}
+}
+
+func TestBatchHelpDocumentsMaxLimit(t *testing.T) {
+	withNoConfig(t)
+
+	out, err := runCLI(t, "--help")
+	if err != nil {
+		t.Fatalf("--help failed: %v", err)
+	}
+	for _, want := range []string{"send-batch", "delete-batch", "hide-batch", "100"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("top-level --help missing %q", want)
+		}
+	}
+
+	for _, cmd := range []string{"send-batch", "delete-batch", "hide-batch"} {
+		out, err := runCLI(t, cmd, "--help")
+		if err != nil {
+			t.Fatalf("%s --help failed: %v", cmd, err)
+		}
+		if !strings.Contains(out, cmd) || !strings.Contains(out, "100") {
+			t.Errorf("%s --help missing command name or 100-item limit:\n%s", cmd, out)
+		}
 	}
 }
