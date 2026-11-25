@@ -197,3 +197,23 @@ the test that asks the frame for permission, which needs someone at the frame
 to tap Allow. The `internal/sdg` and
 `internal/mdns` live tests reach Frameo's own grid servers and the local
 network respectively.
+
+## Fork additions (`mhenaire/unframeo`)
+
+This fork adds script-friendly primitives for idempotent photo synchronization
+and commit-before-ack reaction collection:
+
+- `send -id <int64> -taken <ts>`: explicit `Media.Id` / `ContentId` and capture
+  timestamp (Unix milliseconds or RFC3339). Single-file only when `-id` is non-zero.
+- `send-batch`: reads JSONL items on stdin
+  (`{"ref","path","id","taken","caption","fit","extension"}`) over one frame
+  connection and flushes per-item JSON results (`{"ref","path","id","ok","error"}`)
+  to stdout.
+- `-json`: machine-readable JSON output for `info`, `list`, `send`, `reactions`,
+  and `ack-reactions`.
+- `reactions [-ack] [-wait <dur>]`: triggers a reaction flush (`GetInfo`),
+  collects queued `Reaction(10)` messages (`id`, `media_id`, `type`, `label`,
+  `acknowledge_id`, `timestamp_ms`), and leaves them queued unless `-ack` is set.
+- `ack-reactions [<id>...]`: sends `AcknowledgeReceipt(6)` for reaction IDs
+  given as arguments or on stdin after downstream persistence succeeds.
+

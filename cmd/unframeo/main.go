@@ -33,7 +33,11 @@ Commands:
   pair <code>        pair with the frame showing this code
   info               describe the frame
   send <file|url>... send photos, from disk or from the web
+  send-batch         send photos described by JSON lines on standard input
   list               list the photos on the frame
+  reactions          collect queued photo reactions from the frame
+  ack-reactions <id>...
+                     acknowledge reaction IDs so the frame drops them
   get <id>... | all  copy photos off the frame into files
   hide <id>...       hide photos without removing them
   show <id>...       show photos that were hidden
@@ -56,6 +60,10 @@ Options:
   -discover <dur>    how long to look for the frame on the local network
                      (default 2s)
   -caption <text>    caption to send with a photo
+  -id <n>            photo id for send (zero chooses a fresh id)
+  -taken <ts>        capture time for send (Unix milliseconds or RFC3339)
+  -json              write machine-readable JSON output
+  -ack               with reactions, acknowledge collected reactions
   -out <path>        where get writes: a file for one photo, a directory for many
   -size <which>      which stored copy get asks for: full, preview, or a
                      pixel bound for a frame that divides them elsewhere
@@ -124,9 +132,15 @@ it can send and delete photos as this client.
 `
 
 type options struct {
+	in            io.Reader
 	out           io.Writer
 	frame         string
 	caption       string
+	photoID       int64
+	takenFlag     string
+	taken         time.Time
+	jsonOut       bool
+	ack           bool
 	outPath       string
 	sizeFlag      string
 	size          photoSize
@@ -152,12 +166,20 @@ func main() {
 }
 
 func run(args []string, stdout io.Writer) error {
-	o := options{out: stdout}
+	return runWithIO(args, os.Stdin, stdout)
+}
+
+func runWithIO(args []string, stdin io.Reader, stdout io.Writer) error {
+	o := options{in: stdin, out: stdout}
 	fs := flag.NewFlagSet("unframeo", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	fs.StringVar(&o.frame, "frame", "", "which paired frame to use")
 	fs.StringVar(&o.caption, "caption", "", "caption to send with a photo")
+	fs.Int64Var(&o.photoID, "id", 0, "photo id for send")
+	fs.StringVar(&o.takenFlag, "taken", "", "capture time for send (Unix milliseconds or RFC3339)")
+	fs.BoolVar(&o.jsonOut, "json", false, "write JSON output")
+	fs.BoolVar(&o.ack, "ack", false, "acknowledge collected reactions")
 	fs.StringVar(&o.outPath, "out", "", "where get writes")
 	fs.StringVar(&o.sizeFlag, "size", "", "which stored copy get asks for")
 	fs.DurationVar(&o.wait, "wait", 0, "how long get waits for one photo before asking again")
@@ -186,6 +208,9 @@ func run(args []string, stdout io.Writer) error {
 	}
 	var err error
 	if o.size, err = parseSize(o.sizeFlag); err != nil {
+		return err
+	}
+	if o.taken, err = parseTaken(o.takenFlag); err != nil {
 		return err
 	}
 
@@ -242,8 +267,14 @@ func dispatch(ctx context.Context, cfg *config.Config, o *options, cmd string, r
 		return cmdInfo(ctx, cfg, o)
 	case "send":
 		return cmdSend(ctx, cfg, o, rest)
+	case "send-batch":
+		return cmdSendBatch(ctx, cfg, o)
 	case "list":
 		return cmdList(ctx, cfg, o)
+	case "reactions":
+		return cmdReactions(ctx, cfg, o)
+	case "ack-reactions":
+		return cmdAckReactions(ctx, cfg, o, rest)
 	case "get":
 		return cmdGet(ctx, cfg, o, rest)
 	case "hide":
@@ -311,7 +342,8 @@ func loadConfig(cmdName, path string) (*config.Config, error) {
 // knownCommands is checked before anything is read or written, so an unknown
 // command has no side effects.
 var knownCommands = map[string]bool{
-	"pair": true, "info": true, "send": true, "list": true, "delete": true,
+	"pair": true, "info": true, "send": true, "send-batch": true, "list": true, "delete": true,
+	"reactions": true, "ack-reactions": true,
 	"get":  true,
 	"hide": true, "show": true,
 	"permission": true,
@@ -695,6 +727,9 @@ func cmdInfo(ctx context.Context, cfg *config.Config, o *options) error {
 	if err != nil {
 		return err
 	}
+	if o.jsonOut {
+		return writeJSONInfo(o.out, frame, info)
+	}
 	fmt.Fprintf(o.out, "%s\n", frame)
 	fmt.Fprintf(o.out, "  Reached     over %s\n", frame.via)
 	fmt.Fprintf(o.out, "  Name        %s\n", info.GetName())
@@ -714,6 +749,9 @@ func cmdSend(ctx context.Context, cfg *config.Config, o *options, args []string)
 	if len(args) == 0 {
 		return errors.New("usage: unframeo send <file|url>...")
 	}
+	if o.photoID != 0 && len(args) > 1 {
+		return errors.New("-id can only be used when sending a single photo")
+	}
 	// Every argument becomes a readable file before anything is connected to,
 	// so an unreadable file or a URL that does not answer is reported without
 	// a round trip rather than part way through a batch.
@@ -730,16 +768,27 @@ func cmdSend(ctx context.Context, cfg *config.Config, o *options, args []string)
 	defer c.Close()
 
 	for _, s := range sources {
+		taken := s.taken
+		if !o.taken.IsZero() {
+			taken = o.taken
+		}
 		id, err := c.SendPhoto(ctx, frameo.Photo{
+			ID:            o.photoID,
 			Path:          s.path,
 			Extension:     s.extension,
-			Taken:         s.taken,
+			Taken:         taken,
 			Caption:       o.caption,
 			Fit:           o.fit,
 			SingleSegment: o.singleSegment,
 		})
 		if err != nil {
 			return fmt.Errorf("sending %s: %w", s.name, err)
+		}
+		if o.jsonOut {
+			if err := writeJSONSent(o.out, frame.name, s.name, id); err != nil {
+				return err
+			}
+			continue
 		}
 		fmt.Fprintf(o.out, "Sent %s to %s as %d.\n", s.name, frame, id)
 	}
@@ -756,6 +805,9 @@ func cmdList(ctx context.Context, cfg *config.Config, o *options) error {
 	items, err := c.ListMedia(ctx)
 	if err != nil {
 		return err
+	}
+	if o.jsonOut {
+		return writeJSONList(o.out, items)
 	}
 	if len(items) == 0 {
 		fmt.Fprintf(o.out, "%s holds no photos.\n", frame)

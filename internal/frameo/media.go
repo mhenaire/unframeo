@@ -18,6 +18,9 @@ import (
 
 // Photo describes one photo to send.
 type Photo struct {
+	// ID sets the photo's Media.Id and Media.ContentId on the frame.
+	// Zero generates a fresh random ID.
+	ID int64
 	// Path is the file to read.
 	Path string
 	// Extension is the format the frame files the photo under, without a dot.
@@ -80,7 +83,10 @@ func (c *Client) SendPhoto(ctx context.Context, p Photo) (int64, error) {
 		scale = pb.Media_FIT_INSIDE
 	}
 
-	id := c.newID()
+	id := p.ID
+	if id == 0 {
+		id = c.newID()
+	}
 	media := &pb.Media{
 		Id:            id,
 		ContentId:     id,

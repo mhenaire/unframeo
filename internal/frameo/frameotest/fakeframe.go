@@ -68,6 +68,13 @@ type Frame struct {
 	AsksWhoIsCalling bool
 	// Library is what a listing reports.
 	Library []*pb.MediaMetaData
+	// QueuedReactions are raw TypeReaction (10) payloads pushed when GetInfo
+	// arrives, staying queued until acknowledged by AcknowledgeReceipt (6).
+	QueuedReactions []QueuedReaction
+	// ReactionsBeforeInfo sends queued reactions ahead of FrameInfo when GetInfo
+	// is handled, matching observed real-frame bursts where reactions race
+	// ahead of FrameInfo.
+	ReactionsBeforeInfo bool
 
 	// GetMediaType is the message number this frame serves photos on.
 	// Configurable for the same reason as ListType.
@@ -127,6 +134,7 @@ type Frame struct {
 	unknown  []int32
 	segments int
 	requests []*pb.GetMedia
+	acked    []int64
 	// names is what the client called itself, once per introduction.
 	names []string
 	// permissions is what the client asked to be allowed, in order.
@@ -140,6 +148,12 @@ type Frame struct {
 	stalledHeader *pb.Media
 	stalledStream []byte
 	nextMulti     int64
+}
+
+// QueuedReaction is a reaction queued on the fake frame awaiting acknowledgement.
+type QueuedReaction struct {
+	ID      int64
+	Payload []byte
 }
 
 // Servable is a photo this frame will hand out when asked for it.
@@ -247,6 +261,20 @@ func (f *Frame) PermissionRequests() []int32 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]int32(nil), f.permissions...)
+}
+
+// AckedIDs lists receipt acknowledgement IDs received from the client.
+func (f *Frame) AckedIDs() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.acked...)
+}
+
+// RemainingReactions returns the queued reactions not yet acknowledged.
+func (f *Frame) RemainingReactions() []QueuedReaction {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]QueuedReaction(nil), f.QueuedReactions...)
 }
 
 // Serve runs the frame until the connection ends.
@@ -366,8 +394,44 @@ func (f *Frame) handle(rw MessageRW, msg []byte) error {
 	case 1: // GetInfo
 		f.mu.Lock()
 		info := proto.Clone(f.Info).(*pb.FrameInfo)
+		reactions := append([]QueuedReaction(nil), f.QueuedReactions...)
+		before := f.ReactionsBeforeInfo
 		f.mu.Unlock()
-		return send(rw, 2, info)
+		if before {
+			for _, r := range reactions {
+				if err := sendBytes(rw, 10, r.Payload); err != nil {
+					return err
+				}
+			}
+		}
+		if err := send(rw, 2, info); err != nil {
+			return err
+		}
+		if !before {
+			for _, r := range reactions {
+				if err := sendBytes(rw, 10, r.Payload); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+
+	case 6: // AcknowledgeReceipt
+		var ack pb.AcknowledgeReceipt
+		if err := proto.Unmarshal(payload, &ack); err != nil {
+			return fmt.Errorf("frameotest: malformed acknowledge receipt: %w", err)
+		}
+		f.mu.Lock()
+		f.acked = append(f.acked, ack.GetAcknowledgeId())
+		kept := f.QueuedReactions[:0]
+		for _, r := range f.QueuedReactions {
+			if r.ID != ack.GetAcknowledgeId() {
+				kept = append(kept, r)
+			}
+		}
+		f.QueuedReactions = kept
+		f.mu.Unlock()
+		return nil
 
 	case 3: // ClientInfo: the client saying who it is
 		var who pb.ClientInfo
@@ -661,6 +725,10 @@ func send(rw MessageRW, msgType int32, m proto.Message) error {
 	if err != nil {
 		return err
 	}
+	return sendBytes(rw, msgType, payload)
+}
+
+func sendBytes(rw MessageRW, msgType int32, payload []byte) error {
 	buf := make([]byte, 8+len(payload))
 	binary.BigEndian.PutUint32(buf[0:4], 18)
 	binary.BigEndian.PutUint32(buf[4:8], uint32(msgType))
